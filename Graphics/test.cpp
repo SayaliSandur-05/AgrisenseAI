@@ -1,13 +1,13 @@
 // =============================================================================
-// AgriSense AI  --  Review 2 main application
+// AgriSense AI  --  Review 2 (N zones + paginated view + global alert button)
 // =============================================================================
-// Features in this build:
-//   [1] Real Zone objects + ZoneHistory linked list per zone (PSOOP + PL)
-//   [2] Data-driven CropProfile table -> Zone::checkThresholds() live alerts
-//   [3] Live alert banner in the sidebar
-//   [4] CSV-driven crop picker dropdown (22 crops from Kaggle dataset)
-//   [5] Crop reference card showing N/P/K, pH, rainfall, temp, humidity
-//   [6] History tab backed by a real doubly-linked list
+// New in this build:
+//   - Starts with 1 zone (not 3)
+//   - Global alert button top-right: green when 0 alerts, amber for warnings,
+//     red when any zone has a danger alert
+//   - Clicking the alert button opens a dropdown listing every alerting zone
+//   - Clicking a dropdown row jumps to that zone's page and selects it
+//   - Everything else (crop picker, reference card, history) is unchanged
 // =============================================================================
 
 #include <GL/glut.h>
@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <vector>
+#include <algorithm>
 
 #include "CropProfile.h"
 #include "ZoneHistory.h"
@@ -26,14 +28,39 @@
 // ---------------------------------------------------------------------------
 float rotateX = 0.0f, rotateY = 0.0f, zoom = 0.0f;
 float doorAngle1 = 0.0f, doorAngle2 = 0.0f, doorAngle3 = 0.0f;
-int   zoneCount = 1;
 bool  nightMode = false;
 
+// Rect must be declared BEFORE any structure that stores it.
+struct Rect { int x, y, w, h; };
+
 // ---------------------------------------------------------------------------
-// Real data model
+// Data model
 // ---------------------------------------------------------------------------
-Zone zones[3];
+std::vector<Zone> zones;
+int  zonePage = 0;
+const int ZONES_PER_PAGE = 3;
+
+int totalZones() { return (int)zones.size(); }
+int totalPages() { return (totalZones() + ZONES_PER_PAGE - 1) / ZONES_PER_PAGE; }
+int firstZoneIdx() { return zonePage * ZONES_PER_PAGE; }
+
 char pendingHistory[3][32];
+
+// ---------------------------------------------------------------------------
+// Alert summary helper
+// ---------------------------------------------------------------------------
+struct AlertSummary { int danger; int warning; int total; };
+
+AlertSummary getAlertSummary() {
+    AlertSummary s = {0, 0, 0};
+    for (size_t i = 0; i < zones.size(); i++) {
+        AlertLevel lv = zones[i].getAlertLevel();
+        if (lv == ALERT_DANGER)       s.danger++;
+        else if (lv == ALERT_WARNING) s.warning++;
+    }
+    s.total = s.danger + s.warning;
+    return s;
+}
 
 // ---------------------------------------------------------------------------
 // UI metadata
@@ -63,18 +90,25 @@ int  editingHistoryField = -1;
 
 int  scrollOffset = 0, maxScrollOffset = 0;
 
-// Crop picker state
 bool cropPickerOpen      = false;
 int  cropPickerScroll    = 0;
 int  cropPickerMaxScroll = 0;
 
+// Global alert state
+bool globalAlertPanelOpen = false;
+const int MAX_ALERT_ROWS = 64;
+int  alertZoneIdx[MAX_ALERT_ROWS];
+int  alertZoneCount = 0;
+Rect alertPanelRow[MAX_ALERT_ROWS];
+
 int  winW = 1300, winH = 780;
 const int headerH = 60, sidebarW = 340, footerH = 34;
 
-struct Rect { int x, y, w, h; };
-
 Rect sidebarAddZoneBtn, dayNightBtn;
-Rect zoneListBtn[3];
+Rect globalAlertBtn;
+Rect globalAlertPanel;
+Rect zoneListBtn[ZONES_PER_PAGE];
+Rect zonePrevBtn, zoneNextBtn, zonePageLabel;
 Rect fieldRow[6];
 Rect alertBannerRect;
 Rect cropRefCardRect;
@@ -85,7 +119,6 @@ Rect submitHistoryBtn;
 Rect detailsScrollArea;
 int  detailsTitleY, infoBoxY;
 
-// Crop picker layout
 Rect cropPickerArea;
 Rect cropPickerItem[CROP_DATASET_COUNT];
 Rect cropPickerUpBtn, cropPickerDownBtn, cropPickerCloseBtn;
@@ -103,13 +136,24 @@ bool inRect(Rect r, int x, int y) {
     return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 }
 
-// Copy CSV averages into a zone's editable fields.
 void applyCropSelection(Zone& z, const CropData* cd) {
     std::snprintf(z.getField(0), 32, "%s",   cd->name);
     std::snprintf(z.getField(1), 32, "%.1f", cd->temperature);
     std::snprintf(z.getField(2), 32, "%.1f", cd->humidity);
-    // No soil-moisture column in the CSV -- derive from rainfall.
     std::snprintf(z.getField(4), 32, "%.1f", cd->rainfall / 3.0f);
+}
+
+// Reset all per-zone UI when switching to a different zone
+void selectZoneJump(int zoneIdxZeroBased) {
+    selectedZone = zoneIdxZeroBased + 1;
+    zonePage = zoneIdxZeroBased / ZONES_PER_PAGE;
+    editingField = -1;
+    historyOpen = false;
+    selectedHistoryCategory = -1;
+    editingHistoryField = -1;
+    scrollOffset = 0;
+    cropPickerOpen = false;
+    for (int k = 0; k < 3; k++) pendingHistory[k][0] = '\0';
 }
 
 // ===========================================================================
@@ -120,27 +164,55 @@ void updateLayout()
     winW = glutGet(GLUT_WINDOW_WIDTH);
     winH = glutGet(GLUT_WINDOW_HEIGHT);
 
-    sidebarAddZoneBtn = { 20, (winH - headerH) - 20 - 44, sidebarW - 40, 44 };
-    dayNightBtn       = { winW - 150, winH - 50, 140, 40 };
+    // Top-right header buttons
+    dayNightBtn    = { winW - 150, winH - 50, 140, 40 };
+    globalAlertBtn = { winW - 320, winH - 50, 160, 40 };
 
+    sidebarAddZoneBtn = { 20, (winH - headerH) - 20 - 44, sidebarW - 40, 44 };
+
+    // Zone list (3 fixed slots)
     int listTop = sidebarAddZoneBtn.y - 46;
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < ZONES_PER_PAGE; i++)
         zoneListBtn[i] = { 20, listTop - i * 58, sidebarW - 40, 48 };
 
+    // Page arrows
+    int arrowY = listTop - ZONES_PER_PAGE * 58 - 8;
+    zonePrevBtn   = { 20,            arrowY, 60, 32 };
+    zoneNextBtn   = { sidebarW - 80, arrowY, 60, 32 };
+    zonePageLabel = { 90,            arrowY, sidebarW - 180, 32 };
+
     infoBoxY = footerH + 20;
-    int scrollTop    = listTop - zoneCount * 58 - 10;
+    int scrollTop    = arrowY - 12;
     int scrollBottom = infoBoxY + 46 + 10;
     detailsScrollArea = { 20, scrollBottom, sidebarW - 40, scrollTop - scrollBottom };
 
+    // ---- Global alert panel ----
+    alertZoneCount = 0;
+    for (size_t i = 0; i < zones.size() && alertZoneCount < MAX_ALERT_ROWS; i++) {
+        if (zones[i].getAlertLevel() != ALERT_OK)
+            alertZoneIdx[alertZoneCount++] = (int)i;
+    }
+
+    int panelRowH = 44;
+    int rowsToShow = std::max(1, alertZoneCount);
+    int panelH = 50 + rowsToShow * panelRowH + 10;
+    if (panelH > 460) panelH = 460;
+
+    globalAlertPanel = { winW - 420, winH - 60 - panelH, 400, panelH };
+
+    for (int i = 0; i < alertZoneCount; i++) {
+        int rowY = globalAlertPanel.y + globalAlertPanel.h - 50 - (i + 1) * panelRowH;
+        alertPanelRow[i] = { globalAlertPanel.x + 6, rowY,
+                             globalAlertPanel.w - 12, panelRowH - 4 };
+    }
+
+    // ---- Details panel layout ----
     int topOfScroll = detailsScrollArea.y + detailsScrollArea.h;
     detailsTitleY = topOfScroll - 25;
     int naturalY = detailsTitleY - 60;
 
     int zi = selectedZone - 1;
 
-    // -----------------------------------------------------------------
-    // CROP PICKER LAYOUT
-    // -----------------------------------------------------------------
     if (cropPickerOpen && selectedZone != 0)
     {
         cropPickerArea = detailsScrollArea;
@@ -170,22 +242,16 @@ void updateLayout()
         return;
     }
 
-    // -----------------------------------------------------------------
-    // NORMAL DETAILS / HISTORY LAYOUT
-    // -----------------------------------------------------------------
     if (!historyOpen)
     {
-        // Alert banner
         alertBannerRect = { 20, naturalY, detailsScrollArea.w, 50 };
         naturalY -= 60;
 
-        // Six editable field rows
         for (int j = 0; j < 6; j++) {
             fieldRow[j] = { 20, naturalY, detailsScrollArea.w, 30 };
             naturalY -= 38;
         }
 
-        // Reference card BELOW the last field row.
         const int cardH = 132;
         cropRefCardRect = { 20, naturalY - cardH, detailsScrollArea.w, cardH };
         naturalY -= (cardH + 12);
@@ -207,7 +273,7 @@ void updateLayout()
         }
 
         historyEntryCount = 0;
-        if (selectedZone != 0 && zi >= 0 && zi < 3) {
+        if (selectedZone != 0 && zi >= 0 && zi < totalZones()) {
             ZoneHistory& h = zones[zi].getHistory();
             int n = h.getCount();
             if (n > 0) {
@@ -425,10 +491,28 @@ void drawZoneLabel(const char* t){
     for(int i=0;t[i];i++) glutStrokeCharacter(GLUT_STROKE_ROMAN,t[i]);
     glPopMatrix(); glEnable(GL_LIGHTING);
 }
-void drawGreenhouse(){
-    if(zoneCount>=1){ glPushMatrix(); glTranslatef(14,0,0); drawSingleGreenhouse(doorAngle1); drawZoneLabel("ZONE 1"); glPopMatrix(); }
-    if(zoneCount>=2){ glPushMatrix(); drawSingleGreenhouse(doorAngle2); drawZoneLabel("ZONE 2"); glPopMatrix(); }
-    if(zoneCount>=3){ glPushMatrix(); glTranslatef(-14,0,0); drawSingleGreenhouse(doorAngle3); drawZoneLabel("ZONE 3"); glPopMatrix(); }
+
+// Draw the 3 zones of the current page at fixed positions
+void drawGreenhouse()
+{
+    int first = firstZoneIdx();
+    int total = totalZones();
+    int remaining = total - first;
+    if (remaining <= 0) return;
+
+    float positions[3] = { 14.0f, 0.0f, -14.0f };
+    float doorAngles[3] = { doorAngle1, doorAngle2, doorAngle3 };
+
+    for (int i = 0; i < ZONES_PER_PAGE && i < remaining; i++)
+    {
+        glPushMatrix();
+        glTranslatef(positions[i], 0.0f, 0.0f);
+        drawSingleGreenhouse(doorAngles[i]);
+        char lbl[32];
+        std::sprintf(lbl, "ZONE %d", first + i + 1);
+        drawZoneLabel(lbl);
+        glPopMatrix();
+    }
 }
 
 // ===========================================================================
@@ -443,7 +527,33 @@ void drawHeader(){
     drawText(190,winH-34,GLUT_BITMAP_HELVETICA_18,"|");
     glColor3f(0.30f,0.38f,0.34f);
     drawText(205,winH-34,GLUT_BITMAP_HELVETICA_18,"Smart Greenhouse Management");
-    if(nightMode){
+
+    // ---- Global alert button ----
+    AlertSummary s = getAlertSummary();
+    float r, g, b;
+    char buf[48];
+    if (s.danger > 0)      { r = 0.85f; g = 0.20f; b = 0.20f;
+                             std::sprintf(buf, "ALERT (%d)", s.total); }
+    else if (s.warning > 0){ r = 0.95f; g = 0.65f; b = 0.15f;
+                             std::sprintf(buf, "WARN (%d)", s.total); }
+    else                   { r = 0.20f; g = 0.60f; b = 0.30f;
+                             std::sprintf(buf, "OK - No Alerts"); }
+
+    glColor3f(r, g, b);
+    fillRect(globalAlertBtn.x, globalAlertBtn.y, globalAlertBtn.w, globalAlertBtn.h);
+    glColor3f(1, 1, 1);
+    int textW = (int)std::strlen(buf) * 9;
+    drawText(globalAlertBtn.x + (globalAlertBtn.w - textW) / 2,
+             globalAlertBtn.y + 15,
+             GLUT_BITMAP_HELVETICA_18, buf);
+
+    if (s.danger > 0 || s.warning > 0) {
+        glColor3f(1, 1, 1);
+        drawDot(globalAlertBtn.x + 14, globalAlertBtn.y + 20, 5);
+    }
+
+    // ---- Day/Night button ----
+    if (nightMode) {
         glColor3f(0.55f,0.60f,0.75f); drawDot(winW-130,winH-30,8);
         glColor3f(0.20f,0.30f,0.25f);
         drawText(winW-110,winH-34,GLUT_BITMAP_HELVETICA_18,"Night Mode");
@@ -452,14 +562,65 @@ void drawHeader(){
         glColor3f(0.20f,0.30f,0.25f);
         drawText(winW-110,winH-34,GLUT_BITMAP_HELVETICA_18,"Day Mode");
     }
+
     endOverlay();
 }
+
+// Dropdown listing every alerting zone
+void drawGlobalAlertPanel()
+{
+    Rect p = globalAlertPanel;
+
+    glColor3f(0.15f, 0.25f, 0.20f);
+    fillRect(p.x, p.y, p.w, p.h);
+    glColor3f(0.96f, 0.99f, 0.97f);
+    fillRect(p.x + 2, p.y + 2, p.w - 4, p.h - 4);
+
+    glColor3f(0.15f, 0.25f, 0.20f);
+    drawText(p.x + 14, p.y + p.h - 26, GLUT_BITMAP_HELVETICA_18, "Active Alerts");
+
+    if (alertZoneCount == 0) {
+        glColor3f(0.30f, 0.50f, 0.35f);
+        drawText(p.x + 14, p.y + p.h - 60, GLUT_BITMAP_HELVETICA_12,
+                 "No active alerts. All zones are OK.");
+        return;
+    }
+
+    for (int i = 0; i < alertZoneCount; i++) {
+        int zidx = alertZoneIdx[i];
+        Rect row = alertPanelRow[i];
+
+        AlertLevel lvl = zones[zidx].getAlertLevel();
+        if (lvl == ALERT_DANGER) glColor3f(0.98f, 0.90f, 0.90f);
+        else                     glColor3f(0.99f, 0.96f, 0.85f);
+        fillRect(row.x, row.y, row.w, row.h);
+        if (lvl == ALERT_DANGER) glColor3f(0.75f, 0.30f, 0.30f);
+        else                     glColor3f(0.80f, 0.65f, 0.25f);
+        strokeRect(row.x, row.y, row.w, row.h);
+
+        char line1[128];
+        std::sprintf(line1, "Zone %d", zidx + 1);
+
+        if (lvl == ALERT_DANGER) glColor3f(0.65f, 0.12f, 0.12f);
+        else                     glColor3f(0.55f, 0.38f, 0.02f);
+        drawText(row.x + 10, row.y + 24, GLUT_BITMAP_HELVETICA_18, line1);
+
+        glColor3f(0.15f, 0.25f, 0.20f);
+        drawText(row.x + 10, row.y + 8, GLUT_BITMAP_HELVETICA_12,
+                 zones[zidx].getAlertMessage());
+
+        glColor3f(0.45f, 0.50f, 0.48f);
+        drawText(row.x + row.w - 90, row.y + 12, GLUT_BITMAP_HELVETICA_12,
+                 "click to jump");
+    }
+}
+
 void drawFooter(){
     beginOverlay();
     glColor3f(0.95f,0.98f,0.97f); fillRect(0,0,winW,footerH);
     glColor3f(0.30f,0.38f,0.34f);
     drawText(20,12,GLUT_BITMAP_HELVETICA_12,
-        "Controls:  </> Rotate   ^/v Zoom   Click a Zone to view details");
+        "Controls:  </> Rotate   ^/v Zoom   Arrows page zones   Click a Zone to view details");
     endOverlay();
 }
 
@@ -468,14 +629,12 @@ void drawFooter(){
 // ===========================================================================
 void drawCropPicker(int zi)
 {
-    // Dim overlay
     glColor4f(0.0f, 0.0f, 0.0f, 0.15f);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     fillRect(cropPickerArea.x, cropPickerArea.y, cropPickerArea.w, cropPickerArea.h);
     glDisable(GL_BLEND);
 
-    // Panel background
     glColor3f(0.98f, 0.99f, 0.98f);
     fillRect(cropPickerArea.x, cropPickerArea.y, cropPickerArea.w, cropPickerArea.h);
     glColor3f(0.18f, 0.54f, 0.32f);
@@ -485,7 +644,6 @@ void drawCropPicker(int zi)
     drawText(cropPickerArea.x + 10, cropPickerArea.y + cropPickerArea.h - 56,
              GLUT_BITMAP_HELVETICA_12, "Select a crop (from Kaggle dataset)");
 
-    // Controls
     glColor3f(0.90f, 0.94f, 0.92f);
     fillRect(cropPickerUpBtn.x,    cropPickerUpBtn.y,    cropPickerUpBtn.w,    cropPickerUpBtn.h);
     fillRect(cropPickerCloseBtn.x, cropPickerCloseBtn.y, cropPickerCloseBtn.w, cropPickerCloseBtn.h);
@@ -499,7 +657,6 @@ void drawCropPicker(int zi)
     drawText(cropPickerCloseBtn.x + 12, cropPickerCloseBtn.y + 10, GLUT_BITMAP_HELVETICA_12, "Cancel");
     drawText(cropPickerDownBtn.x + 12,  cropPickerDownBtn.y + 10,  GLUT_BITMAP_HELVETICA_12, "v");
 
-    // List clipping
     int listTopY = cropPickerUpBtn.y - 8;
     int listBotY = cropPickerArea.y + 4;
     glScissor(cropPickerArea.x, listBotY, cropPickerArea.w, listTopY - listBotY);
@@ -529,7 +686,6 @@ void drawCropPicker(int zi)
     }
     glDisable(GL_SCISSOR_TEST);
 
-    // Scrollbar
     if (cropPickerMaxScroll > 0)
     {
         int trackX = cropPickerArea.x + cropPickerArea.w - 10;
@@ -558,32 +714,77 @@ void drawSidebar()
     glColor3f(0.85f, 0.90f, 0.87f);
     strokeRect(0, footerH, sidebarW, winH - headerH - footerH);
 
-    // Add-Zone button
     Rect ab = sidebarAddZoneBtn;
-    if (zoneCount < 3) glColor3f(0.18f, 0.54f, 0.32f); else glColor3f(0.55f, 0.55f, 0.55f);
+    glColor3f(0.18f, 0.54f, 0.32f);
     fillRect(ab.x, ab.y, ab.w, ab.h);
     glColor3f(1, 1, 1);
-    drawText(ab.x + 30, ab.y + 15, GLUT_BITMAP_HELVETICA_18,
-             (zoneCount < 3) ? "+  Add Zone" : "Max 3 Zones");
+    drawText(ab.x + 30, ab.y + 15, GLUT_BITMAP_HELVETICA_18, "+  Add Zone");
 
     glColor3f(0.15f, 0.25f, 0.20f);
     drawText(20, ab.y - 26, GLUT_BITMAP_HELVETICA_18, "Zones");
 
-    for (int i = 0; i < zoneCount; i++) {
+    int first = firstZoneIdx();
+    int total = totalZones();
+
+    for (int i = 0; i < ZONES_PER_PAGE; i++) {
+        int actualIdx = first + i;
+        if (actualIdx >= total) break;
+
         Rect r = zoneListBtn[i];
-        bool active = (selectedZone == i + 1);
-        if (active) glColor3f(0.85f, 0.95f, 0.88f); else glColor3f(0.93f, 0.96f, 0.94f);
+        bool active = (selectedZone == actualIdx + 1);
+
+        if (active) glColor3f(0.85f, 0.95f, 0.88f);
+        else        glColor3f(0.93f, 0.96f, 0.94f);
         fillRect(r.x, r.y, r.w, r.h);
-        if (active) glColor3f(0.18f, 0.54f, 0.32f); else glColor3f(0.75f, 0.80f, 0.77f);
+        if (active) glColor3f(0.18f, 0.54f, 0.32f);
+        else        glColor3f(0.75f, 0.80f, 0.77f);
         strokeRect(r.x, r.y, r.w, r.h);
-        glColor3f(0.20f, 0.55f, 0.30f);
+
+        AlertLevel lv = zones[actualIdx].getAlertLevel();
+        if (lv == ALERT_DANGER)       glColor3f(0.85f, 0.20f, 0.20f);
+        else if (lv == ALERT_WARNING) glColor3f(0.95f, 0.65f, 0.15f);
+        else                          glColor3f(0.20f, 0.55f, 0.30f);
         drawDot(r.x + 18, r.y + r.h / 2, 5);
-        char label[16]; std::sprintf(label, "Zone %d", i + 1);
+
+        char label[32];
+        std::sprintf(label, "Zone %d", actualIdx + 1);
         glColor3f(0.12f, 0.28f, 0.20f);
         drawText(r.x + 36, r.y + r.h / 2 - 5, GLUT_BITMAP_HELVETICA_18, label);
+
+        if (lv != ALERT_OK) {
+            if (lv == ALERT_DANGER) glColor3f(0.85f, 0.20f, 0.20f);
+            else                    glColor3f(0.95f, 0.65f, 0.15f);
+            fillRect(r.x + r.w - 30, r.y + r.h / 2 - 8, 20, 16);
+            glColor3f(1, 1, 1);
+            drawText(r.x + r.w - 24, r.y + r.h / 2 - 4,
+                     GLUT_BITMAP_HELVETICA_12, "!");
+        }
     }
 
-    if (selectedZone != 0)
+    bool canPrev = (zonePage > 0);
+    bool canNext = (zonePage < totalPages() - 1);
+
+    if (canPrev) glColor3f(0.18f, 0.54f, 0.32f);
+    else         glColor3f(0.70f, 0.75f, 0.72f);
+    fillRect(zonePrevBtn.x, zonePrevBtn.y, zonePrevBtn.w, zonePrevBtn.h);
+    glColor3f(1, 1, 1);
+    drawText(zonePrevBtn.x + 14, zonePrevBtn.y + 10,
+             GLUT_BITMAP_HELVETICA_18, "<<");
+
+    if (canNext) glColor3f(0.18f, 0.54f, 0.32f);
+    else         glColor3f(0.70f, 0.75f, 0.72f);
+    fillRect(zoneNextBtn.x, zoneNextBtn.y, zoneNextBtn.w, zoneNextBtn.h);
+    glColor3f(1, 1, 1);
+    drawText(zoneNextBtn.x + 14, zoneNextBtn.y + 10,
+             GLUT_BITMAP_HELVETICA_18, ">>");
+
+    char pg[40];
+    std::sprintf(pg, "Page %d of %d", zonePage + 1, std::max(1, totalPages()));
+    glColor3f(0.30f, 0.38f, 0.34f);
+    drawText(zonePageLabel.x + 10, zonePageLabel.y + 12,
+             GLUT_BITMAP_HELVETICA_12, pg);
+
+    if (selectedZone != 0 && selectedZone <= total)
     {
         int zi = selectedZone - 1;
 
@@ -598,9 +799,6 @@ void drawSidebar()
         glColor3f(0.12f, 0.28f, 0.20f);
         drawText(20, detailsTitleY, GLUT_BITMAP_HELVETICA_18, title);
 
-        // =============================================================
-        // CROP PICKER MODE
-        // =============================================================
         if (cropPickerOpen)
         {
             drawCropPicker(zi);
@@ -609,12 +807,8 @@ void drawSidebar()
             return;
         }
 
-        // =============================================================
-        // DETAILS VIEW
-        // =============================================================
         if (!historyOpen)
         {
-            // ---- Alert banner ----
             AlertLevel lvl = zones[zi].getAlertLevel();
             float bgR, bgG, bgB, txR, txG, txB; const char* statusWord;
             if (lvl == ALERT_DANGER)      { bgR=0.98f;bgG=0.85f;bgB=0.85f; txR=0.65f;txG=0.12f;txB=0.12f; statusWord="ALERT"; }
@@ -637,7 +831,6 @@ void drawSidebar()
             drawText(alertBannerRect.x + 8, alertBannerRect.y + 6,
                      GLUT_BITMAP_HELVETICA_12, "Live threshold check");
 
-            // ---- Field rows ----
             for (int j = 0; j < 6; j++)
             {
                 Rect r = fieldRow[j];
@@ -646,7 +839,6 @@ void drawSidebar()
 
                 if (j == 0)
                 {
-                    // Crop Type -> dropdown-style button
                     const char* cur = zones[zi].getField(0);
                     bool empty = (cur[0] == '\0');
                     glColor3f(0.86f, 0.94f, 0.89f);
@@ -664,7 +856,6 @@ void drawSidebar()
                 }
                 else
                 {
-                    // Editable text fields
                     char* buf = zones[zi].getField(j);
                     if (editingField == j) {
                         glColor3f(0.90f, 0.96f, 0.92f);
@@ -679,7 +870,6 @@ void drawSidebar()
                 }
             }
 
-            // ---- Reference card ----
             const CropData* cd = findCropData(zones[zi].getField(0));
             if (cd)
             {
@@ -693,22 +883,19 @@ void drawSidebar()
                 drawText(c.x + 8, c.y + c.h - 18,
                          GLUT_BITMAP_HELVETICA_12, "Crop Reference Card (CSV)");
 
-                char line1[64], line2[64], line3[64], line4[64];
-                std::sprintf(line1, "N:%.0f   P:%.0f   K:%.0f", cd->N, cd->P, cd->K);
-                std::sprintf(line2, "Temp avg: %.1f C", cd->temperature);
-                std::sprintf(line3, "Humidity: %.1f %%", cd->humidity);
-                std::sprintf(line4, "pH: %.2f   Rain: %.0f mm", cd->ph, cd->rainfall);
+                char l1[64], l2[64], l3[64], l4[64];
+                std::sprintf(l1, "N:%.0f   P:%.0f   K:%.0f", cd->N, cd->P, cd->K);
+                std::sprintf(l2, "Temp avg: %.1f C", cd->temperature);
+                std::sprintf(l3, "Humidity: %.1f %%", cd->humidity);
+                std::sprintf(l4, "pH: %.2f   Rain: %.0f mm", cd->ph, cd->rainfall);
 
                 glColor3f(0.15f, 0.25f, 0.20f);
-                drawText(c.x + 8, c.y + c.h - 40, GLUT_BITMAP_HELVETICA_12, line1);
-                drawText(c.x + 8, c.y + c.h - 60, GLUT_BITMAP_HELVETICA_12, line2);
-                drawText(c.x + 8, c.y + c.h - 80, GLUT_BITMAP_HELVETICA_12, line3);
-                drawText(c.x + 8, c.y + c.h - 100, GLUT_BITMAP_HELVETICA_12, line4);
+                drawText(c.x + 8, c.y + c.h - 40, GLUT_BITMAP_HELVETICA_12, l1);
+                drawText(c.x + 8, c.y + c.h - 60, GLUT_BITMAP_HELVETICA_12, l2);
+                drawText(c.x + 8, c.y + c.h - 80, GLUT_BITMAP_HELVETICA_12, l3);
+                drawText(c.x + 8, c.y + c.h - 100, GLUT_BITMAP_HELVETICA_12, l4);
             }
         }
-        // =============================================================
-        // HISTORY VIEW
-        // =============================================================
         else
         {
             for (int i = 0; i < 6; i++) {
@@ -781,7 +968,6 @@ void drawSidebar()
             }
         }
 
-        // History toggle
         Rect hb = historyToggleBtn;
         if (historyOpen) glColor3f(0.18f, 0.54f, 0.32f); else glColor3f(0.90f, 0.94f, 0.92f);
         fillRect(hb.x, hb.y, hb.w, hb.h);
@@ -822,7 +1008,6 @@ void drawSidebar()
 // ===========================================================================
 void mouse(int button, int state, int x, int y)
 {
-    // Scroll wheel
     if (button == 3 || button == 4) {
         if (state != GLUT_DOWN) return;
         int wy = winH - y;
@@ -848,6 +1033,26 @@ void mouse(int button, int state, int x, int y)
 
     if (button != GLUT_LEFT_BUTTON || state != GLUT_DOWN) return;
     y = winH - y;
+
+    // ---- Global alert button ----
+    if (inRect(globalAlertBtn, x, y)) {
+        globalAlertPanelOpen = !globalAlertPanelOpen;
+        glutPostRedisplay(); return;
+    }
+
+    // ---- Alert panel is open ----
+    if (globalAlertPanelOpen)
+    {
+        for (int i = 0; i < alertZoneCount; i++) {
+            if (inRect(alertPanelRow[i], x, y)) {
+                selectZoneJump(alertZoneIdx[i]);
+                globalAlertPanelOpen = false;
+                glutPostRedisplay(); return;
+            }
+        }
+        if (inRect(globalAlertPanel, x, y)) return;
+        globalAlertPanelOpen = false;
+    }
 
     // ---- Crop picker mode ----
     if (cropPickerOpen && selectedZone != 0)
@@ -880,9 +1085,10 @@ void mouse(int button, int state, int x, int y)
         return;
     }
 
-    // Add zone
+    // ---- Add zone ----
     if (inRect(sidebarAddZoneBtn, x, y)) {
-        if (zoneCount < 3) zoneCount++;
+        zones.emplace_back((int)zones.size() + 1);
+        zonePage = totalPages() - 1;
         glutPostRedisplay(); return;
     }
     if (inRect(dayNightBtn, x, y)) {
@@ -890,21 +1096,29 @@ void mouse(int button, int state, int x, int y)
         glutPostRedisplay(); return;
     }
 
-    for (int i = 0; i < zoneCount; i++) {
+    // ---- Prev / Next ----
+    if (inRect(zonePrevBtn, x, y) && zonePage > 0) {
+        zonePage--;
+        glutPostRedisplay(); return;
+    }
+    if (inRect(zoneNextBtn, x, y) && zonePage < totalPages() - 1) {
+        zonePage++;
+        glutPostRedisplay(); return;
+    }
+
+    // ---- Zone selection ----
+    int first = firstZoneIdx();
+    int total = totalZones();
+    for (int i = 0; i < ZONES_PER_PAGE; i++) {
+        int actualIdx = first + i;
+        if (actualIdx >= total) break;
         if (inRect(zoneListBtn[i], x, y)) {
-            selectedZone = i + 1;
-            editingField = -1;
-            historyOpen = false;
-            selectedHistoryCategory = -1;
-            editingHistoryField = -1;
-            scrollOffset = 0;
-            cropPickerOpen = false;
-            for (int k = 0; k < 3; k++) pendingHistory[k][0] = '\0';
+            selectZoneJump(actualIdx);
             glutPostRedisplay(); return;
         }
     }
 
-    if (selectedZone != 0 && inRect(detailsScrollArea, x, y))
+    if (selectedZone != 0 && selectedZone <= total && inRect(detailsScrollArea, x, y))
     {
         if (inRect(historyToggleBtn, x, y)) {
             historyOpen = !historyOpen;
@@ -984,17 +1198,20 @@ void specialKeys(int key, int x, int y) {
 // ===========================================================================
 void keyboard(unsigned char key, int x, int y)
 {
-    // ESC closes crop picker
-    if (key == 27 && cropPickerOpen) {
-        cropPickerOpen = false;
-        cropPickerScroll = 0;
-        glutPostRedisplay(); return;
+    if (key == 27) {
+        if (cropPickerOpen) {
+            cropPickerOpen = false;
+            cropPickerScroll = 0;
+            glutPostRedisplay(); return;
+        }
+        if (globalAlertPanelOpen) {
+            globalAlertPanelOpen = false;
+            glutPostRedisplay(); return;
+        }
     }
-
-    // Don't allow text typing while picker is open
     if (cropPickerOpen) return;
 
-    if (editingField != -1 && selectedZone != 0)
+    if (editingField != -1 && selectedZone != 0 && selectedZone <= totalZones())
     {
         char* buf = zones[selectedZone - 1].getField(editingField);
         int len = (int)std::strlen(buf);
@@ -1034,8 +1251,10 @@ void keyboard(unsigned char key, int x, int y)
 // ===========================================================================
 void display()
 {
+    for (size_t i = 0; i < zones.size(); i++)
+        zones[i].checkThresholds();
+
     updateLayout();
-    for (int i = 0; i < 3; i++) zones[i].checkThresholds();
 
     if (nightMode) {
         glClearColor(0.04f, 0.06f, 0.16f, 1.0f);
@@ -1072,7 +1291,11 @@ void display()
     drawGround(); drawGreenLand(); drawGrassLand(); drawGreenhouse();
 
     glViewport(0, 0, winW, winH);
-    drawSidebar(); drawHeader(); drawFooter();
+
+    drawSidebar();
+    drawHeader();
+    if (globalAlertPanelOpen) drawGlobalAlertPanel();
+    drawFooter();
 
     glutSwapBuffers();
 }
@@ -1112,7 +1335,7 @@ int main(int argc, char** argv)
     GLfloat globalAmbient[] = { 0.25f, 0.25f, 0.25f, 1 };
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, globalAmbient);
 
-    for (int i = 0; i < 3; i++) zones[i] = Zone(i + 1);
+    zones.emplace_back(1);
 
     glutDisplayFunc(display);
     glutReshapeFunc(reshape);
